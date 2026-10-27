@@ -128,8 +128,11 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 VEHICLE_MAX_RANGE_MILES = 500
 VEHICLE_MPG = 10
 
-# Local fuel price dataset (lat/lon file will replace this later)
-FUEL_PRICES_PATH = BASE_DIR / 'data' / 'fuel-prices.csv'
+# How far a station may sit from the route line and still count
+STATION_MAX_DETOUR_MILES = 10
+
+# Local fuel price dataset with coordinates (see scripts/locate_stations.py)
+FUEL_PRICES_PATH = BASE_DIR / 'data' / 'fuel-prices-located.csv'
 
 # Free map / routing providers (no API key required)
 NOMINATIM_URL = 'https://nominatim.openstreetmap.org/search'

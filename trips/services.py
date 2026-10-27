@@ -1,8 +1,8 @@
 """
-Geocoding and routing for trip planning.
+Geocoding, routing, and fuel planning for a US road trip.
 
 Uses Nominatim (places → coordinates) and OSRM (coordinates → driving route).
-Results are cached so a repeated request does not hit those APIs again.
+Fuel stations come from the local CSV; map APIs are not used for prices.
 """
 
 import hashlib
@@ -13,6 +13,9 @@ from django.conf import settings
 from django.core.cache import cache
 
 from .exceptions import TripPlanningError
+from .fuel import plan_fuel_stops
+from .geo import stations_along_route
+from .stations import load_stations
 
 METERS_PER_MILE = 1609.344
 
@@ -106,13 +109,20 @@ def build_map_url(start: dict, finish: dict) -> str:
 
 def plan_trip(start_place: str, finish_place: str) -> dict:
     """
-    Geocode start and finish, then request one driving route.
+    Build a full trip plan: route, nearby stations, and cheap fuel stops.
 
-    Returns a JSON-serializable trip summary. Fuel stops are added later.
+    Map/routing APIs are used only for geocoding and one driving route.
     """
     start = geocode(start_place)
     finish = geocode(finish_place)
     route = get_route(start, finish)
+
+    nearby = stations_along_route(
+        load_stations(),
+        route["route_geojson"],
+        max_detour_miles=settings.STATION_MAX_DETOUR_MILES,
+    )
+    fuel = plan_fuel_stops(nearby, route["distance_miles"])
 
     return {
         "start": start_place,
@@ -121,6 +131,14 @@ def plan_trip(start_place: str, finish_place: str) -> dict:
         "finish_location": finish,
         "distance_miles": route["distance_miles"],
         "duration_seconds": route["duration_seconds"],
+        "mpg": settings.VEHICLE_MPG,
+        "max_range_miles": settings.VEHICLE_MAX_RANGE_MILES,
+        "gallons_needed": fuel["gallons_needed"],
+        "gallons_purchased": fuel["gallons_purchased"],
+        "total_cost_usd": fuel["total_cost_usd"],
+        "fuel_stops": fuel["fuel_stops"],
+        "stations_considered": len(nearby),
         "route_geojson": route["route_geojson"],
         "map_url": build_map_url(start, finish),
     }
+

@@ -11,3 +11,6 @@ build/
 .env
 .coverage
 htmlcov/
+
+# Downloaded reference used only by scripts/locate_stations.py
+data/us_cities_ref.csv
