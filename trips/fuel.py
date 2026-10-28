@@ -1,151 +1,149 @@
-"""
-Choose cost-effective fuel stops along a route.
+"""Forward-only, capacity-constrained fuel planning on an ordered route.
 
-Assumptions (stated in the assignment / README):
-- Tank range is VEHICLE_MAX_RANGE_MILES (500).
-- Vehicle gets VEHICLE_MPG (10) miles per gallon.
-- Trip starts with a full tank (that fuel is not charged again).
-- Any amount can be bought at a station, up to a full tank.
+Without detours this is the standard next-cheaper-station greedy algorithm.
+With straight-line station detours it is a cost-conscious heuristic: all legs
+include the detours, but the globally cheapest choice of detours is not promised.
 """
 
-from __future__ import annotations
-
-import heapq
+from decimal import Decimal, ROUND_HALF_UP
+import math
 
 from django.conf import settings
 
 from .exceptions import TripPlanningError
 
+EPSILON = 1e-7
 
-def plan_fuel_stops(
-    route_stations: list[dict],
-    distance_miles: float,
-) -> dict:
-    """
-    Greedy cheapest-fuel plan using a min-heap of reachable stations.
 
-    Returns gallons purchased, total USD, and the stop list.
-    """
+def _can_reach_finish(stations, distance_miles, max_range):
+    """Work backward to find stations with a feasible onward journey."""
+    can_finish = [False] * len(stations)
+    for index in range(len(stations) - 1, -1, -1):
+        station = stations[index]
+        # Leaving a station includes the detour back to the main route.
+        to_finish = distance_miles - station["mile"] + station["detour_miles"]
+        if to_finish <= max_range + EPSILON:
+            can_finish[index] = True
+            continue
+
+        for next_index in range(index + 1, len(stations)):
+            next_station = stations[next_index]
+            leg = next_station["mile"] - station["mile"] + station["detour_miles"]
+            if leg > max_range + EPSILON:
+                break
+            if can_finish[next_index] and leg + next_station["detour_miles"] <= max_range + EPSILON:
+                can_finish[index] = True
+                break
+    return can_finish
+
+
+def plan_fuel_stops(route_stations: list[dict], distance_miles: float) -> dict:
+    """Choose forward stops and track fuel purchases, tank levels and detours."""
     max_range = float(settings.VEHICLE_MAX_RANGE_MILES)
     mpg = float(settings.VEHICLE_MPG)
-    tank_gallons = max_range / mpg
+    if not math.isfinite(distance_miles) or distance_miles < 0:
+        raise TripPlanningError("Route distance must be a finite, non-negative number.")
 
-    if distance_miles <= 0:
-        return {
-            "gallons_needed": 0.0,
-            "gallons_purchased": 0.0,
-            "total_cost_usd": 0.0,
-            "fuel_stops": [],
-        }
-
-    # Destination is a final checkpoint where we never buy fuel.
-    stops = [
-        {
-            "name": station["name"],
-            "mile": float(station["mile"]),
-            "price": float(station["price"]),
-            "lat": station["lat"],
-            "lon": station["lon"],
-            "city": station["city"],
-            "state": station["state"],
-            "address": station["address"],
-        }
-        for station in route_stations
-        if 0 < float(station["mile"]) < distance_miles
-    ]
-    stops.append(
-        {
-            "name": "DESTINATION",
-            "mile": float(distance_miles),
-            "price": None,
-            "lat": None,
-            "lon": None,
-            "city": None,
-            "state": None,
-            "address": None,
-            "is_destination": True,
-        }
+    stations = sorted(
+        (dict(station, mile=float(station["mile"]),
+              detour_miles=float(station.get("detour_miles", 0)))
+         for station in route_stations if 0 <= float(station["mile"]) < distance_miles),
+        key=lambda station: (station["mile"], float(station["price"]), station.get("opis_id", "")),
     )
+    # Detours can make a cheap station a dead end even when a nearby alternative
+    # permits the trip. Backward reachability prevents choosing those dead ends.
+    can_finish = _can_reach_finish(stations, distance_miles, max_range)
+    current_mile = current_detour = traveled = 0.0
+    # Fuel is tracked as miles of range; convert to gallons only for purchases/output.
+    remaining_range = max_range
+    current = None
+    index = -1
+    purchases = []
+    total_gallons = 0.0
+    total_cost = Decimal("0")
 
-    fuel_miles = max_range  # start full
-    prev_mile = 0.0
-    # heap entries: (price, sequence, gallons_room_left_at_station, station_dict)
-    heap: list[tuple[float, int, float, dict]] = []
-    seq = 0
-    purchases: dict[int, dict] = {}
-
-    for stop in stops:
-        gap = stop["mile"] - prev_mile
-        if gap > max_range and not heap and fuel_miles < gap:
-            raise TripPlanningError(
-                f"Cannot cover {gap:.1f} miles without a fuel stop "
-                f"(max range is {max_range:.0f} miles)."
-            )
-
-        # Buy just enough from the cheapest stations already passed.
-        while fuel_miles < gap:
-            if not heap:
-                raise TripPlanningError(
-                    "No reachable fuel station within vehicle range "
-                    f"near mile {prev_mile + fuel_miles:.1f}."
-                )
-
-            price, _, room, station = heapq.heappop(heap)
-            if room <= 1e-9:
-                continue
-
-            need = gap - fuel_miles
-            buy_miles = min(need, room)
-            buy_gallons = buy_miles / mpg
-            cost = buy_gallons * price
-
-            station_id = id(station)
-            if station_id not in purchases:
-                purchases[station_id] = {
-                    "name": station["name"],
-                    "address": station["address"],
-                    "city": station["city"],
-                    "state": station["state"],
-                    "lat": station["lat"],
-                    "lon": station["lon"],
-                    "mile": station["mile"],
-                    "price_per_gallon": round(price, 4),
-                    "gallons": 0.0,
-                    "cost_usd": 0.0,
-                }
-            purchases[station_id]["gallons"] += buy_gallons
-            purchases[station_id]["cost_usd"] += cost
-
-            fuel_miles += buy_miles
-            leftover = room - buy_miles
-            if leftover > 1e-9:
-                heapq.heappush(heap, (price, seq, leftover, station))
-                seq += 1
-
-        fuel_miles -= gap
-        prev_mile = stop["mile"]
-
-        if stop.get("is_destination"):
+    while True:
+        to_finish = distance_miles - current_mile + current_detour
+        if to_finish <= remaining_range + EPSILON:
+            traveled += to_finish
             break
 
-        # Arriving at a station: we could fill up to a full tank here later.
-        room = tank_gallons * mpg - fuel_miles
-        if room > 1e-9:
-            heapq.heappush(heap, (stop["price"], seq, room, stop))
-            seq += 1
+        reachable = []
+        for i in range(index + 1, len(stations)):
+            station = stations[i]
+            along = station["mile"] - current_mile
+            if along + current_detour > max_range + EPSILON:
+                break
+            # Each leg includes returning to the route and reaching the next pump.
+            leg = along + current_detour + station["detour_miles"]
+            if can_finish[i] and leg <= max_range + EPSILON:
+                reachable.append((i, station, leg))
 
-    fuel_stops = sorted(purchases.values(), key=lambda s: s["mile"])
-    for stop in fuel_stops:
-        stop["gallons"] = round(stop["gallons"], 2)
-        stop["cost_usd"] = round(stop["cost_usd"], 2)
+        cheaper = None
+        if current is not None:
+            cheaper = next((item for item in reachable
+                            if float(item[1]["price"]) < float(current["price"])), None)
+        # Buy just enough for the first cheaper stop, or for the destination.
+        if cheaper is not None:
+            target = cheaper
+            desired = target[2]
+        elif current is not None and to_finish <= max_range + EPSILON:
+            target = None
+            desired = to_finish
+        elif reachable:
+            # Otherwise fill up and choose the cheapest reachable stop.
+            target = min(reachable, key=lambda item: (
+                float(item[1]["price"]), -float(item[1]["mile"]), item[2]
+            ))
+            desired = max_range
+        else:
+            raise TripPlanningError(
+                f"No reachable fuel station after route mile {current_mile:.1f}; "
+                f"the {max_range:.0f}-mile range includes estimated station detours."
+            )
 
-    gallons_purchased = round(sum(s["gallons"] for s in fuel_stops), 2)
-    total_cost = round(sum(s["cost_usd"] for s in fuel_stops), 2)
-    gallons_needed = round(distance_miles / mpg, 2)
+        if current is not None:
+            buy_miles = max(0.0, desired - remaining_range)
+            if buy_miles > EPSILON:
+                gallons = buy_miles / mpg
+                # Round each receipt before adding it to the trip's total cost.
+                charge = (Decimal(str(gallons)) * Decimal(str(current["price"]))).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                purchases.append({
+                    **{k: current.get(k) for k in (
+                        "opis_id", "name", "address", "city", "state", "lat", "lon",
+                        "route_lat", "route_lon",
+                    )},
+                    "mile": float(current["mile"]),
+                    "detour_miles": current_detour,
+                    "coordinate_source": current.get("coordinate_source", "city_centroid"),
+                    "price_per_gallon": float(current["price"]),
+                    "gallons": round(gallons, 6),
+                    "cost_usd": float(charge),
+                    "arrival_fuel_gallons": round(remaining_range / mpg, 6),
+                    "departure_fuel_gallons": round((remaining_range + buy_miles) / mpg, 6),
+                })
+                total_gallons += gallons
+                total_cost += charge
+                remaining_range += buy_miles
+
+        if target is None:
+            traveled += to_finish
+            break
+        index, current, leg = target
+        if leg > remaining_range + EPSILON:
+            raise TripPlanningError("No fuel station can be reached with the remaining fuel.")
+        remaining_range = max(0.0, remaining_range - leg)
+        traveled += leg
+        current_mile = float(current["mile"])
+        current_detour = current["detour_miles"]
 
     return {
-        "gallons_needed": gallons_needed,
-        "gallons_purchased": gallons_purchased,
-        "total_cost_usd": total_cost,
-        "fuel_stops": fuel_stops,
+        "gallons_needed": round(traveled / mpg, 6),
+        "gallons_purchased": round(total_gallons, 6),
+        "total_cost_usd": float(total_cost),
+        "estimated_distance_miles": round(traveled, 6),
+        "estimated_detour_miles": round(traveled - distance_miles, 6),
+        "fuel_stops": purchases,
     }

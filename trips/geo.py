@@ -1,136 +1,138 @@
-"""Geometry helpers for placing stations along a driving route."""
-
-from __future__ import annotations
+"""Project stations onto route segments using a small spatial grid."""
 
 import math
 from collections import defaultdict
 
 EARTH_RADIUS_MILES = 3958.7613
+GRID_CELL_DEGREES = 0.2
+MAX_SEGMENT_MILES = 5
+MILES_PER_LATITUDE_DEGREE = 69
 
 
-def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance between two WGS84 points, in miles."""
+def decode_polyline6(encoded):
+    """Expand OSRM's compact, six-decimal route into GeoJSON coordinates."""
+    coordinates = []
+    position = 0
+    latitude = longitude = 0
+    while position < len(encoded):
+        deltas = []
+        for _ in range(2):
+            value = 0
+            # Each character carries five bits; the sixth bit means 'continue'.
+            for shift in range(0, 35, 5):
+                chunk = ord(encoded[position]) - 63
+                position += 1
+                if not 0 <= chunk <= 63:
+                    raise ValueError("Invalid polyline character")
+                value |= (chunk & 31) << shift
+                if chunk < 32:
+                    break
+            else:
+                raise ValueError("Invalid polyline coordinate")
+            deltas.append(~(value >> 1) if value & 1 else value >> 1)
+        latitude += deltas[0]
+        longitude += deltas[1]
+        # Encoded points use lat/lon order; GeoJSON uses lon/lat order.
+        coordinates.append([longitude / 1_000_000, latitude / 1_000_000])
+    return coordinates
+
+
+def haversine_miles(lat1, lon1, lat2, lon2):
+    """Return the straight-line distance along the Earth's surface."""
     rlat1, rlon1, rlat2, rlon2 = map(math.radians, (lat1, lon1, lat2, lon2))
-    dlat = rlat2 - rlat1
-    dlon = rlon2 - rlon1
-    a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2
-    )
-    return 2 * EARTH_RADIUS_MILES * math.asin(math.sqrt(a))
+    a = (math.sin((rlat2 - rlat1) / 2) ** 2
+         + math.cos(rlat1) * math.cos(rlat2) * math.sin((rlon2 - rlon1) / 2) ** 2)
+    return 2 * EARTH_RADIUS_MILES * math.asin(math.sqrt(min(1, max(0, a))))
 
 
-def build_route_samples(
-    geojson_line: dict,
-    sample_every_miles: float = 5.0,
-) -> list[dict]:
+def _project_onto_segment(lat, lon, segment):
+    """Return the nearest route point and its fraction along a short segment."""
+    lon1, lat1, lon2, lat2, _, _ = segment
+    # Longitude degrees shrink toward the poles; adjust before projecting.
+    cosine = math.cos(math.radians((lat1 + lat2) / 2))
+    dx, dy = (lon2 - lon1) * cosine, lat2 - lat1
+    ratio = ((lon - lon1) * cosine * dx + (lat - lat1) * dy) / (dx * dx + dy * dy)
+    ratio = max(0, min(1, ratio))  # Clamp to the segment's endpoints.
+    route_lon = lon1 + (lon2 - lon1) * ratio
+    route_lat = lat1 + (lat2 - lat1) * ratio
+    return route_lat, route_lon, ratio
+
+
+def stations_along_route(stations, route_geojson, max_detour_miles,
+                         route_distance_miles=None):
+    """Attach route mileage and estimated one-way off-route distance.
+
+    Full geometry vertices are preserved. Long segments are subdivided only to
+    bound spatial-index work. Mile markers are scaled to OSRM's road distance.
+    Proximity does not establish road access; detours remain straight-line estimates.
     """
-    Walk a GeoJSON LineString and emit points with cumulative mile markers.
-
-    Coordinates in GeoJSON are [lon, lat].
-    """
-    coords = geojson_line.get("coordinates") or []
+    coords = route_geojson.get("coordinates") or []
     if len(coords) < 2:
         return []
-
-    samples: list[dict] = []
-    prev_lon, prev_lat = coords[0]
-    mile = 0.0
-    samples.append({"lat": prev_lat, "lon": prev_lon, "mile": 0.0})
-    next_sample_at = sample_every_miles
-
-    for lon, lat in coords[1:]:
-        segment = haversine_miles(prev_lat, prev_lon, lat, lon)
-        if segment == 0:
+    cell = GRID_CELL_DEGREES
+    grid = defaultdict(list)
+    segments = []
+    cumulative = 0.0
+    for (lon1, lat1), (lon2, lat2) in zip(coords, coords[1:]):
+        length = haversine_miles(lat1, lon1, lat2, lon2)
+        if not length:
             continue
-
-        traveled = 0.0
-        while mile + (segment - traveled) >= next_sample_at:
-            step = next_sample_at - mile
-            ratio = (traveled + step) / segment
-            samples.append(
-                {
-                    "lat": prev_lat + (lat - prev_lat) * ratio,
-                    "lon": prev_lon + (lon - prev_lon) * ratio,
-                    "mile": round(next_sample_at, 3),
-                }
-            )
-            traveled += step
-            mile = next_sample_at
-            next_sample_at += sample_every_miles
-
-        mile += segment - traveled
-        prev_lat, prev_lon = lat, lon
-
-    end_lon, end_lat = coords[-1]
-    last = samples[-1]
-    if last["lat"] != end_lat or last["lon"] != end_lon:
-        samples.append({"lat": end_lat, "lon": end_lon, "mile": round(mile, 3)})
-
-    return samples
-
-
-def _grid_key(lat: float, lon: float, cell: float) -> tuple[int, int]:
-    return (int(math.floor(lat / cell)), int(math.floor(lon / cell)))
-
-
-def stations_along_route(
-    stations: tuple[dict, ...],
-    route_geojson: dict,
-    max_detour_miles: float,
-) -> list[dict]:
-    """
-    Keep stations near the route and attach a mile marker to each.
-
-    When several stations map to the same mile bucket, the cheapest is kept.
-    """
-    samples = build_route_samples(route_geojson)
-    if not samples:
+        count = max(1, math.ceil(length / MAX_SEGMENT_MILES))
+        for part in range(count):
+            a, b = part / count, (part + 1) / count
+            x1, y1 = lon1 + (lon2 - lon1) * a, lat1 + (lat2 - lat1) * a
+            x2, y2 = lon1 + (lon2 - lon1) * b, lat1 + (lat2 - lat1) * b
+            segment_length = length / count
+            index = len(segments)
+            segments.append((x1, y1, x2, y2, cumulative, segment_length))
+            # Index every grid cell crossed by the segment's bounding box.
+            for i in range(math.floor(min(y1, y2) / cell), math.floor(max(y1, y2) / cell) + 1):
+                for j in range(math.floor(min(x1, x2) / cell), math.floor(max(x1, x2) / cell) + 1):
+                    grid[i, j].append(index)
+            cumulative += segment_length
+    if not segments:
         return []
-
-    lats = [p["lat"] for p in samples]
-    lons = [p["lon"] for p in samples]
-    pad = (max_detour_miles / 69.0) + 0.05
-    min_lat, max_lat = min(lats) - pad, max(lats) + pad
-    min_lon, max_lon = min(lons) - pad, max(lons) + pad
-
-    # ~0.2° ≈ 14 miles — nearby cells cover the detour window.
-    cell = 0.2
-    grid: dict[tuple[int, int], list[dict]] = defaultdict(list)
-    for point in samples:
-        grid[_grid_key(point["lat"], point["lon"], cell)].append(point)
-
-    best_by_mile: dict[int, dict] = {}
-
+    # Geometry measures straight segments; OSRM supplies the road's total distance.
+    scale = route_distance_miles / cumulative if route_distance_miles is not None else 1
+    lat_pad = max_detour_miles / MILES_PER_LATITUDE_DEGREE + 0.001
+    lon_pad = lat_pad / max(0.01, math.cos(math.radians(max(abs(p[1]) for p in coords))))
+    min_lat, max_lat = min(p[1] for p in coords) - lat_pad, max(p[1] for p in coords) + lat_pad
+    min_lon, max_lon = min(p[0] for p in coords) - lon_pad, max(p[0] for p in coords) + lon_pad
+    lat_cells = math.ceil(lat_pad / cell)
+    results = []
+    matches_by_location = {}
     for station in stations:
-        lat = station["lat"]
-        lon = station["lon"]
+        lat, lon = station["lat"], station["lon"]
         if not (min_lat <= lat <= max_lat and min_lon <= lon <= max_lon):
             continue
-
-        gi, gj = _grid_key(lat, lon, cell)
-        closest = None
-        closest_dist = max_detour_miles
-
-        for di in (-1, 0, 1):
-            for dj in (-1, 0, 1):
-                for point in grid.get((gi + di, gj + dj), ()):
-                    dist = haversine_miles(lat, lon, point["lat"], point["lon"])
-                    if dist <= closest_dist:
-                        closest_dist = dist
-                        closest = point
-
-        if closest is None:
+        # City-based stations often share coordinates. Match the location once,
+        # while retaining every station's own identity and price.
+        location = (lat, lon)
+        if location in matches_by_location:
+            closest = matches_by_location[location]
+            if closest is not None:
+                results.append({**station, **closest})
             continue
-
-        mile_key = int(round(closest["mile"]))
-        candidate = {
-            **station,
-            "mile": round(closest["mile"], 2),
-            "detour_miles": round(closest_dist, 2),
-        }
-        existing = best_by_mile.get(mile_key)
-        if existing is None or candidate["price"] < existing["price"]:
-            best_by_mile[mile_key] = candidate
-
-    return sorted(best_by_mile.values(), key=lambda s: s["mile"])
+        lon_cells = math.ceil(lat_pad / max(0.01, math.cos(math.radians(lat))) / cell)
+        i, j = math.floor(lat / cell), math.floor(lon / cell)
+        candidates = set()
+        for di in range(-lat_cells, lat_cells + 1):
+            for dj in range(-lon_cells, lon_cells + 1):
+                candidates.update(grid.get((i + di, j + dj), ()))
+        closest = None
+        closest_distance = max_detour_miles
+        for index in sorted(candidates):
+            segment = segments[index]
+            mile, length = segment[4:]
+            route_lat, route_lon, ratio = _project_onto_segment(lat, lon, segment)
+            distance = haversine_miles(lat, lon, route_lat, route_lon)
+            if distance <= closest_distance:
+                closest_distance = distance
+                closest = {
+                    "mile": (mile + ratio * length) * scale,
+                    "detour_miles": distance, "route_lat": route_lat, "route_lon": route_lon,
+                }
+        matches_by_location[location] = closest
+        if closest is not None:
+            results.append({**station, **closest})
+    return sorted(results, key=lambda s: (s["mile"], s["price"], s.get("opis_id", "")))

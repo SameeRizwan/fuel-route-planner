@@ -15,6 +15,8 @@ located CSV only.
 from __future__ import annotations
 
 import csv
+import argparse
+import math
 import re
 import sys
 import urllib.request
@@ -25,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE_CSV = ROOT / "data" / "fuel-prices.csv"
 OUTPUT_CSV = ROOT / "data" / "fuel-prices-located.csv"
 CITIES_CSV = ROOT / "data" / "us_cities_ref.csv"
+UNMATCHED_CSV = ROOT / "data" / "fuel-prices-unmatched.csv"
 
 CITIES_URL = (
     "https://raw.githubusercontent.com/kelvins/US-Cities-Database/"
@@ -93,17 +96,39 @@ def load_city_index() -> dict[tuple[str, str], tuple[float, float]]:
     return index
 
 
-def locate_stations() -> None:
+def load_verified_coordinates(path):
+    if path is None:
+        return {}
+    result = {}
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            lat, lon = float(row["lat"]), float(row["lon"])
+            if not (math.isfinite(lat) and math.isfinite(lon)
+                    and -90 <= lat <= 90 and -180 <= lon <= 180):
+                raise ValueError("Invalid verified coordinates")
+            key = row["opis_id"].strip()
+            if key in result and result[key] != (lat, lon):
+                raise ValueError(f"Conflicting coordinates for OPIS ID {key}")
+            result[key] = (lat, lon)
+    return result
+
+
+def locate_stations(coordinates_path=None, strict=False) -> None:
     if not SOURCE_CSV.exists():
         sys.exit(f"Missing source file: {SOURCE_CSV}")
 
-    ensure_cities_reference()
-    city_index = load_city_index()
+    verified = load_verified_coordinates(coordinates_path)
+    if strict:
+        city_index = {}
+    else:
+        ensure_cities_reference()
+        city_index = load_city_index()
 
     matched = 0
     skipped_non_us = 0
     unmatched_keys: set[tuple[str, str]] = set()
     output_rows: list[dict] = []
+    unmatched_rows = []
 
     with SOURCE_CSV.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -116,9 +141,14 @@ def locate_stations() -> None:
                 skipped_non_us += 1
                 continue
 
-            coords = city_index.get((city_key, state))
+            coords = verified.get(row["OPIS Truckstop ID"].strip())
+            coordinate_source = "verified"
+            if coords is None:
+                coords = city_index.get((city_key, state))
+                coordinate_source = "city_centroid"
             if coords is None:
                 unmatched_keys.add((city_raw, state))
+                unmatched_rows.append(row)
                 continue
 
             lat, lon = coords
@@ -133,6 +163,7 @@ def locate_stations() -> None:
                     "price": row["Retail Price"].strip(),
                     "lat": f"{lat:.6f}",
                     "lon": f"{lon:.6f}",
+                    "coordinate_source": coordinate_source,
                 }
             )
 
@@ -145,15 +176,23 @@ def locate_stations() -> None:
         "price",
         "lat",
         "lon",
+        "coordinate_source",
     ]
     with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(output_rows)
 
+    with UNMATCHED_CSV.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=reader.fieldnames)
+        writer.writeheader()
+        writer.writerows(unmatched_rows)
+
     print(f"US stations matched:   {matched}")
     print(f"Non-US rows skipped:   {skipped_non_us}")
     print(f"Unmatched city+state:  {len(unmatched_keys)}")
+    print(f"Unmatched US rows:     {len(unmatched_rows)} (see {UNMATCHED_CSV})")
+    print(f"Verified rows:         {sum(r['coordinate_source'] == 'verified' for r in output_rows)}")
     print(f"Wrote {OUTPUT_CSV}")
     if unmatched_keys:
         sample = sorted(unmatched_keys)[:15]
@@ -163,4 +202,8 @@ def locate_stations() -> None:
 
 
 if __name__ == "__main__":
-    locate_stations()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--coordinates", type=Path, help="Verified CSV with opis_id,lat,lon columns")
+    parser.add_argument("--strict", action="store_true", help="Include only stations with verified coordinates")
+    args = parser.parse_args()
+    locate_stations(coordinates_path=args.coordinates, strict=args.strict)

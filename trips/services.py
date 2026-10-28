@@ -1,144 +1,168 @@
-"""
-Geocoding, routing, and fuel planning for a US road trip.
-
-Uses Nominatim (places → coordinates) and OSRM (coordinates → driving route).
-Fuel stations come from the local CSV; map APIs are not used for prices.
-"""
+"""Three provider calls at most: geocode each endpoint, then route once."""
 
 import hashlib
-from urllib.parse import urlencode
+import math
+from time import perf_counter
 
 import requests
 from django.conf import settings
 from django.core.cache import cache
 
-from .exceptions import TripPlanningError
+from .exceptions import MapServiceError, TripPlanningError
 from .fuel import plan_fuel_stops
-from .geo import stations_along_route
+from .geo import decode_polyline6, stations_along_route
 from .stations import load_stations
 
 METERS_PER_MILE = 1609.344
 
 
-def _cache_key(prefix: str, value: str) -> str:
-    digest = hashlib.sha256(value.lower().strip().encode()).hexdigest()[:32]
-    return f"trips:{prefix}:{digest}"
+def _cache_key(prefix, value):
+    """Keep cache keys short and ignore location spelling case/outer whitespace."""
+    digest = hashlib.sha256(value.casefold().strip().encode()).hexdigest()[:32]
+    return f"trips:v2:{prefix}:{digest}"
 
 
-def geocode(place: str) -> dict:
-    """Resolve a place name to a US latitude/longitude."""
-    place = place.strip()
+def _get_json(url, params):
+    """Make one provider request, leaving HTTP failures for the API view to handle."""
+    response = requests.get(
+        url, params=params, headers={"User-Agent": settings.MAP_USER_AGENT},
+        timeout=settings.MAP_HTTP_TIMEOUT,
+    )
+    response.raise_for_status()
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise MapServiceError("Map service returned an invalid response.") from exc
+
+
+def geocode(place):
+    """Resolve a US place name, reusing a cached location when available."""
     key = _cache_key("geocode", place)
     cached = cache.get(key)
     if cached is not None:
         return cached
-
-    response = requests.get(
-        settings.NOMINATIM_URL,
-        params={
-            "q": place,
-            "format": "json",
-            "limit": 1,
-            "addressdetails": 1,
-            "countrycodes": "us",
-        },
-        headers={"User-Agent": settings.MAP_USER_AGENT},
-        timeout=settings.MAP_HTTP_TIMEOUT,
-    )
-    response.raise_for_status()
-    results = response.json()
+    results = _get_json(settings.NOMINATIM_URL, {
+        "q": place.strip(), "format": "json", "limit": 1,
+        "addressdetails": 1, "countrycodes": "us",
+    })
+    if not isinstance(results, list):
+        raise MapServiceError("Geocoder returned an invalid response.")
     if not results:
         raise TripPlanningError(f"No US location found for '{place}'.")
-
-    hit = results[0]
-    country = (hit.get("address") or {}).get("country_code", "").lower()
-    if country and country != "us":
+    try:
+        hit = results[0]
+        country = hit["address"]["country_code"].lower()
+        lat, lon = float(hit["lat"]), float(hit["lon"])
+        if not (math.isfinite(lat) and math.isfinite(lon)
+                and -90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ValueError("Invalid coordinate")
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise MapServiceError("Geocoder returned an invalid location.") from exc
+    if country != "us":
         raise TripPlanningError(f"'{place}' is outside the USA.")
-
-    location = {
-        "lat": float(hit["lat"]),
-        "lon": float(hit["lon"]),
-        "display_name": hit.get("display_name", place),
-    }
+    location = {"lat": lat, "lon": lon, "display_name": hit.get("display_name", place)}
     cache.set(key, location, settings.ROUTE_CACHE_TTL)
     return location
 
 
-def get_route(start: dict, finish: dict) -> dict:
-    """Fetch a single driving route between two coordinate pairs."""
-    key = _cache_key(
-        "route",
-        f"{start['lat']},{start['lon']}|{finish['lat']},{finish['lon']}",
-    )
+def get_route(start, finish):
+    """Fetch a driving route; OSRM expects longitude before latitude."""
+    key = _cache_key("route", f"{start['lat']},{start['lon']}|{finish['lat']},{finish['lon']}")
     cached = cache.get(key)
     if cached is not None:
         return cached
-
     path = f"{start['lon']},{start['lat']};{finish['lon']},{finish['lat']}"
-    response = requests.get(
-        f"{settings.OSRM_URL}/{path}",
-        params={"overview": "full", "geometries": "geojson"},
-        headers={"User-Agent": settings.MAP_USER_AGENT},
-        timeout=settings.MAP_HTTP_TIMEOUT,
-    )
-    response.raise_for_status()
-    payload = response.json()
-
-    if payload.get("code") != "Ok" or not payload.get("routes"):
+    payload = _get_json(f"{settings.OSRM_URL}/{path}", {
+        # Keep every route point, but transfer a compact encoding from OSRM.
+        "overview": "full", "geometries": "polyline6",
+    })
+    if not isinstance(payload, dict):
+        raise MapServiceError("Routing service returned an invalid response.")
+    if payload.get("code") in {"NoRoute", "NoSegment"}:
         raise TripPlanningError("No driving route found between those places.")
-
-    route = payload["routes"][0]
+    try:
+        if payload["code"] != "Ok":
+            raise ValueError("Unexpected routing response")
+        route = payload["routes"][0]
+        distance, duration = float(route["distance"]), float(route["duration"])
+        geometry = route["geometry"]
+        if isinstance(geometry, str):
+            geometry = {"type": "LineString", "coordinates": decode_polyline6(geometry)}
+        if (not math.isfinite(distance) or distance < 0
+                or not math.isfinite(duration) or duration < 0
+                or geometry["type"] != "LineString" or len(geometry["coordinates"]) < 2):
+            raise ValueError("Invalid route")
+        for lon, lat in geometry["coordinates"]:
+            if not (math.isfinite(lon) and math.isfinite(lat)
+                    and -180 <= lon <= 180 and -90 <= lat <= 90):
+                raise ValueError("Invalid geometry coordinate")
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        raise MapServiceError("Routing service returned an invalid route.") from exc
     result = {
-        "distance_miles": round(route["distance"] / METERS_PER_MILE, 2),
-        "duration_seconds": int(route["duration"]),
-        "route_geojson": route["geometry"],
+        "distance_miles": distance / METERS_PER_MILE,
+        "duration_seconds": int(duration),
+        "route_geojson": geometry,
     }
     cache.set(key, result, settings.ROUTE_CACHE_TTL)
     return result
 
 
-def build_map_url(start: dict, finish: dict) -> str:
-    query = urlencode(
-        {
-            "engine": "fossgis_osrm_car",
-            "route": f"{start['lat']},{start['lon']};{finish['lat']},{finish['lon']}",
-        }
+def _timed_call(timings, name, function, *args, **kwargs):
+    """Record milliseconds for Postman's Server-Timing response header."""
+    started = perf_counter()
+    try:
+        return function(*args, **kwargs)
+    finally:
+        timings[name] = (perf_counter() - started) * 1000
+
+
+def plan_trip(start_place, finish_place, *, timings=None):
+    """Combine local station prices, a driving route and the fuel purchase plan."""
+    if timings is None:
+        timings = {}
+    path = settings.FUEL_PRICES_PATH
+    # A changed dataset or vehicle setting must invalidate the cached plan.
+    fingerprint = (str(path), path.stat().st_mtime_ns) if path.exists() else "missing"
+    plan_inputs = (
+        start_place.strip().casefold(),
+        finish_place.strip().casefold(),
+        fingerprint,
+        settings.VEHICLE_MAX_RANGE_MILES,
+        settings.VEHICLE_MPG,
+        settings.STATION_MAX_DETOUR_MILES,
     )
-    return f"https://www.openstreetmap.org/directions?{query}"
-
-
-def plan_trip(start_place: str, finish_place: str) -> dict:
-    """
-    Build a full trip plan: route, nearby stations, and cheap fuel stops.
-
-    Map/routing APIs are used only for geocoding and one driving route.
-    """
-    start = geocode(start_place)
-    finish = geocode(finish_place)
-    route = get_route(start, finish)
-
-    nearby = stations_along_route(
-        load_stations(),
+    key = _cache_key("plan-v3", repr(plan_inputs))
+    cached = _timed_call(timings, "cache", cache.get, key)
+    if cached is not None:
+        return cached
+    stations = _timed_call(timings, "stations", load_stations)
+    start = _timed_call(timings, "geocode_start", geocode, start_place)
+    finish = _timed_call(timings, "geocode_finish", geocode, finish_place)
+    route = _timed_call(timings, "routing", get_route, start, finish)
+    nearby = _timed_call(
+        timings, "matching", stations_along_route,
+        stations,
         route["route_geojson"],
         max_detour_miles=settings.STATION_MAX_DETOUR_MILES,
+        route_distance_miles=route["distance_miles"],
     )
-    fuel = plan_fuel_stops(nearby, route["distance_miles"])
-
-    return {
-        "start": start_place,
-        "finish": finish_place,
-        "start_location": start,
-        "finish_location": finish,
-        "distance_miles": route["distance_miles"],
-        "duration_seconds": route["duration_seconds"],
-        "mpg": settings.VEHICLE_MPG,
-        "max_range_miles": settings.VEHICLE_MAX_RANGE_MILES,
-        "gallons_needed": fuel["gallons_needed"],
-        "gallons_purchased": fuel["gallons_purchased"],
-        "total_cost_usd": fuel["total_cost_usd"],
-        "fuel_stops": fuel["fuel_stops"],
+    fuel = _timed_call(timings, "fuel", plan_fuel_stops, nearby, route["distance_miles"])
+    warnings = [
+        "Station detours are straight-line estimates, not verified driving distances or road access.",
+        "Fuel stops are cost-effective candidates; global optimality with detours is not guaranteed.",
+        "The vehicle starts full. Total cost covers purchases during the trip and excludes starting fuel.",
+    ]
+    if any(stop["coordinate_source"] != "verified" for stop in fuel["fuel_stops"]):
+        warnings.insert(0, "Some fuel markers are city coordinates, not verified station locations.")
+    result = {
+        "start": start_place, "finish": finish_place,
+        "start_location": start, "finish_location": finish, **route, **fuel,
+        "mpg": settings.VEHICLE_MPG, "max_range_miles": settings.VEHICLE_MAX_RANGE_MILES,
+        "initial_fuel_gallons": settings.VEHICLE_MAX_RANGE_MILES / settings.VEHICLE_MPG,
+        "fuel_cost_basis": "purchases_during_trip", "starting_fuel_cost_included": False,
         "stations_considered": len(nearby),
-        "route_geojson": route["route_geojson"],
-        "map_url": build_map_url(start, finish),
+        "warnings": warnings, "distance_basis": "route_plus_estimated_station_detours",
+        "attribution": "© OpenStreetMap contributors (ODbL); routing by OSRM; OPIS fuel price CSV.",
     }
-
+    cache.set(key, result, settings.ROUTE_CACHE_TTL)
+    return result

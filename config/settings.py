@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -143,8 +144,9 @@ ROUTE_CACHE_TTL = 60 * 60 * 24  # 24 hours
 
 CACHES = {
     'default': {
-        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'fuel-route-cache',
+        'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
+        'LOCATION': os.environ.get('MAP_CACHE_DIR', str(BASE_DIR / '.cache' / 'maps')),
+        'OPTIONS': {'MAX_ENTRIES': 2000},
     }
 }
 

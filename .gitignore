@@ -9,6 +9,8 @@ db.sqlite3
 dist/
 build/
 .env
+.cache/
+data/fuel-prices-unmatched.csv
 .coverage
 htmlcov/
 
